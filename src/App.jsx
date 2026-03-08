@@ -1,4 +1,4 @@
- import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
 import { 
   Mic, Upload, Trash2, History, BarChart3, 
@@ -8,7 +8,7 @@ import {
 import './App.css';
 
 // API base URL
-const API_URL = 'http://localhost:8000';
+const API_URL = 'https://call-fraud-fast-api.onrender.com/';
 
 function App() {
   // State management
@@ -75,11 +75,18 @@ function App() {
       };
 
       mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/mp3' });
-        await processLiveRecording(audioBlob);
-        
-        // Stop all tracks
-        stream.getTracks().forEach(track => track.stop());
+        const recordedBlob = new Blob(audioChunksRef.current); // raw media blob (browser default codec)
+        try {
+          const wavBlob = await convertBlobToWav(recordedBlob);
+          await processLiveRecording(wavBlob, 'recording.wav'); // send WAV
+        } catch (err) {
+          console.error('Failed to convert recording to WAV:', err);
+          // Fallback: send original blob with inferred extension
+          const ext = recordedBlob.type ? recordedBlob.type.split('/')[1] : 'webm';
+          await processLiveRecording(recordedBlob, `recording.${ext}`);
+        } finally {
+          stream.getTracks().forEach(track => track.stop());
+        }
       };
 
       mediaRecorder.start();
@@ -117,13 +124,81 @@ function App() {
     }
   };
 
-  // Process live recording
-  const processLiveRecording = async (audioBlob) => {
+  // Process live recording (convert to WAV client-side, send with correct filename)
+  async function convertBlobToWav(blob) {
+    const arrayBuffer = await blob.arrayBuffer();
+    const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    const wavArrayBuffer = encodeWAV(audioBuffer);
+    return new Blob([wavArrayBuffer], { type: 'audio/wav' });
+  }
+
+  function encodeWAV(audioBuffer) {
+    const numChannels = audioBuffer.numberOfChannels;
+    const sampleRate = audioBuffer.sampleRate;
+
+    // Use first channel for mono; if stereo, interleave channels
+    let samples;
+    if (numChannels === 1) {
+      samples = audioBuffer.getChannelData(0);
+    } else {
+      const left = audioBuffer.getChannelData(0);
+      const right = audioBuffer.getChannelData(1);
+      samples = interleave(left, right);
+    }
+
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+
+    /* WAV header */
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + samples.length * 2, true);
+    writeString(view, 8, 'WAVE');
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true); // PCM chunk size
+    view.setUint16(20, 1, true); // Audio format (1 = PCM)
+    view.setUint16(22, 1, true); // Num channels (mono)
+    view.setUint32(24, sampleRate, true); // Sample rate
+    view.setUint32(28, sampleRate * 2, true); // Byte rate (sampleRate * blockAlign)
+    view.setUint16(32, 2, true); // Block align (numChannels * bytesPerSample)
+    view.setUint16(34, 16, true); // Bits per sample
+    writeString(view, 36, 'data');
+    view.setUint32(40, samples.length * 2, true);
+
+    // PCM samples
+    floatTo16BitPCM(view, 44, samples);
+
+    return view.buffer;
+
+    function writeString(dataview, offset, string) {
+      for (let i = 0; i < string.length; i++) {
+        dataview.setUint8(offset + i, string.charCodeAt(i));
+      }
+    }
+    function floatTo16BitPCM(output, offset, input) {
+      for (let i = 0; i < input.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, input[i]));
+        output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+    }
+    function interleave(inputL, inputR) {
+      const length = inputL.length + inputR.length;
+      const result = new Float32Array(length);
+      let idx = 0;
+      for (let i = 0; i < inputL.length; i++) {
+        result[idx++] = inputL[i];
+        result[idx++] = inputR[i];
+      }
+      return result;
+    }
+  }
+
+  const processLiveRecording = async (audioBlob, filename = 'recording.wav') => {
     setIsProcessing(true);
     
     try {
       const formData = new FormData();
-      formData.append('file', audioBlob, 'recording.mp3');
+      formData.append('file', audioBlob, filename);
 
       const response = await axios.post(`${API_URL}/process-live-recording`, formData);
 
@@ -588,6 +663,73 @@ function App() {
       </footer>
     </div>
   );
+}
+
+async function convertBlobToWav(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  const wavArrayBuffer = encodeWAV(audioBuffer);
+  return new Blob([wavArrayBuffer], { type: 'audio/wav' });
+}
+
+function encodeWAV(audioBuffer) {
+  const numChannels = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  // Use first channel for mono; for stereo interleave both channels
+  let samples;
+  if (numChannels === 1) {
+    samples = audioBuffer.getChannelData(0);
+  } else {
+    const left = audioBuffer.getChannelData(0);
+    const right = audioBuffer.getChannelData(1);
+    samples = interleave(left, right);
+  }
+
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  /* WAV header */
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true); // PCM chunk size
+  view.setUint16(20, 1, true); // Audio format (1 = PCM)
+  view.setUint16(22, 1, true); // Num channels (mono)
+  view.setUint32(24, sampleRate, true); // Sample rate
+  view.setUint32(28, sampleRate * 2, true); // Byte rate (sampleRate * blockAlign)
+  view.setUint16(32, 2, true); // Block align (numChannels * bytesPerSample)
+  view.setUint16(34, 16, true); // Bits per sample
+  writeString(view, 36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+
+  // PCM samples
+  floatTo16BitPCM(view, 44, samples);
+
+  return view.buffer;
+
+  function writeString(dataview, offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      dataview.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+  function floatTo16BitPCM(output, offset, input) {
+    for (let i = 0; i < input.length; i++, offset += 2) {
+      let s = Math.max(-1, Math.min(1, input[i]));
+      output.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+  }
+  function interleave(inputL, inputR) {
+    const length = inputL.length + inputR.length;
+    const result = new Float32Array(length);
+    let idx = 0;
+    for (let i = 0; i < inputL.length; i++) {
+      result[idx++] = inputL[i];
+      result[idx++] = inputR[i];
+    }
+    return result;
+  }
 }
 
 export default App;
